@@ -1,11 +1,14 @@
 package block
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +48,18 @@ func NewBlock(nonce int, previousHash [32]byte, transactions []*Transaction) *Bl
 	return b
 }
 
+func (b *Block) PreviousHash() [32]byte {
+	return b.previousHash
+}
+
+func (b *Block) Nonce() int {
+	return b.nonce
+}
+
+func (b *Block) Transactions() []*Transaction {
+	return b.transactions
+}
+
 func (b *Block) Print() {
 	fmt.Printf("timestamp       %d\n", b.timestamp)
 	fmt.Printf("nonce           %d\n", b.nonce)
@@ -73,6 +88,27 @@ func (b *Block) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (b *Block) UnmarshalJSON(data []byte) error {
+	var previousHash string
+	v := &struct {
+		Timestamp    *int64          `json:"timestamp"`
+		Nonce        *int            `json:"nonce"`
+		PreviousHash *string         `json:"previous_hash"`
+		Transactions *[]*Transaction `json:"transactions"`
+	}{
+		Timestamp:    &b.timestamp,
+		Nonce:        &b.nonce,
+		PreviousHash: &previousHash,
+		Transactions: &b.transactions,
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	ph, _ := hex.DecodeString(*v.PreviousHash)
+	copy(b.previousHash[:], ph[:32])
+	return nil
+}
+
 /*
 ******BLOCKCHAIN STRUCT******
  */
@@ -96,6 +132,15 @@ func NewBlockchain(blockchainAddress string, port uint16) *Blockchain {
 	return bc
 }
 
+func (bc *Blockchain) Chain() []*Block {
+	return bc.chain
+}
+
+func (bc *Blockchain) Run() {
+	bc.startSyncNeighbors()
+	bc.ResolveConflicts()
+}
+
 func (bc *Blockchain) SetNeighbors() {
 	bc.neighbors = utils.FindNeighbors(
 		utils.GetHost(), bc.port,
@@ -106,22 +151,56 @@ func (bc *Blockchain) SetNeighbors() {
 	log.Printf("%v", bc.neighbors)
 }
 
+func (bc *Blockchain) SyncNeighbors() {
+	bc.muxNeighbors.Lock()
+	defer bc.muxNeighbors.Unlock()
+	bc.SetNeighbors()
+}
+
+func (bc *Blockchain) startSyncNeighbors() {
+	bc.SyncNeighbors()
+	_ = time.AfterFunc(time.Second*BLOCKCHAIN_NEIGHBOR_SYNC_TIME_SEC, bc.startSyncNeighbors)
+}
+
+func (bc *Blockchain) ClearTransactionPool() {
+	bc.transactionPool = bc.transactionPool[:0]
+}
+
 func (bc *Blockchain) TransactionPool() []*Transaction {
 	return bc.transactionPool
 }
 
 func (bc *Blockchain) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		Blocks []*Block `json:"chains"`
+		Blocks []*Block `json:"chain"`
 	}{
 		Blocks: bc.chain,
 	})
+}
+
+func (bc *Blockchain) UnmarshalJSON(data []byte) error {
+	v := &struct {
+		Blocks *[]*Block `json:"chain"`
+	}{
+		Blocks: &bc.chain,
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (bc *Blockchain) CreateBlock(nonce int, previousHash [32]byte) *Block {
 	b := NewBlock(nonce, previousHash, bc.transactionPool)
 	bc.chain = append(bc.chain, b)
 	bc.transactionPool = []*Transaction{}
+	for _, n := range bc.neighbors {
+		endpoint := fmt.Sprintf("http://%s/transactions", n)
+		client := &http.Client{}
+		req, _ := http.NewRequest("DELETE", endpoint, nil)
+		resp, _ := client.Do(req)
+		log.Printf("%v", resp)
+	}
 	return b
 }
 
@@ -142,8 +221,22 @@ func (bc *Blockchain) CreateTransaction(sender string, recipient string, value f
 	senderPublicKey *ecdsa.PublicKey, s *utils.Signature) bool {
 	isTransacted := bc.AddTransaction(sender, recipient, value, senderPublicKey, s)
 
-	// TODO
-	// Sync
+	if isTransacted {
+		for _, n := range bc.neighbors {
+			publicKeyStr := fmt.Sprintf("%064x%064x", senderPublicKey.X.Bytes(),
+				senderPublicKey.Y.Bytes())
+			signatureStr := s.String()
+			bt := &TransactionRequest{
+				&sender, &recipient, &publicKeyStr, &value, &signatureStr}
+			m, _ := json.Marshal(bt)
+			buf := bytes.NewBuffer(m)
+			endpoint := fmt.Sprintf("http://%s/transactions", n)
+			client := &http.Client{}
+			req, _ := http.NewRequest("PUT", endpoint, buf)
+			resp, _ := client.Do(req)
+			log.Printf("%v", resp)
+		}
+	}
 
 	return isTransacted
 }
@@ -221,6 +314,15 @@ func (bc *Blockchain) Mining() bool {
 	previousHash := bc.LastBlock().Hash()
 	bc.CreateBlock(nonce, previousHash)
 	log.Println("action=mining, status=success")
+
+	for _, n := range bc.neighbors {
+		endpoint := fmt.Sprintf("http://%s/consensus", n)
+		client := &http.Client{}
+		req, _ := http.NewRequest("PUT", endpoint, nil)
+		resp, _ := client.Do(req)
+		log.Printf("%v", resp)
+	}
+
 	return true
 }
 
@@ -244,6 +346,55 @@ func (bc *Blockchain) CalculateTotalAmount(blockchainAddress string) float32 {
 		}
 	}
 	return totalAmount
+}
+
+func (bc *Blockchain) ValidChain(chain []*Block) bool {
+	preBlock := chain[0]
+	currentIndex := 1
+	for currentIndex < len(chain) {
+		b := chain[currentIndex]
+		if b.previousHash != preBlock.Hash() {
+			return false
+		}
+
+		if !bc.ValidProof(b.Nonce(), b.PreviousHash(), b.Transactions(), MINING_DIFFICULTY) {
+			return false
+		}
+
+		preBlock = b
+		currentIndex += 1
+	}
+	return true
+}
+
+func (bc *Blockchain) ResolveConflicts() bool {
+	var longestChain []*Block = nil
+	maxLength := len(bc.chain)
+
+	for _, n := range bc.neighbors {
+		endpoint := fmt.Sprintf("http://%s/chain", n)
+		resp, _ := http.Get(endpoint)
+		if resp.StatusCode == 200 {
+			var bcResp Blockchain
+			decoder := json.NewDecoder(resp.Body)
+			_ = decoder.Decode(&bcResp)
+
+			chain := bcResp.Chain()
+
+			if len(chain) > maxLength && bc.ValidChain(chain) {
+				maxLength = len(chain)
+				longestChain = chain
+			}
+		}
+	}
+
+	if longestChain != nil {
+		bc.chain = longestChain
+		log.Printf("Resolve conflicts replaced")
+		return true
+	}
+	log.Printf("Resolve conflicts not replaced")
+	return false
 }
 
 /*
@@ -279,6 +430,22 @@ func (t *Transaction) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (t *Transaction) UnmarshalJSON(data []byte) error {
+	v := &struct {
+		Sender    *string  `json:"sender_blockchain_address"`
+		Recipient *string  `json:"recipient_blockchain_address"`
+		Value     *float32 `json:"value"`
+	}{
+		Sender:    &t.senderBlockchainAddress,
+		Recipient: &t.recipientBlockchainAddress,
+		Value:     &t.value,
+	}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	return nil
+}
+
 type TransactionRequest struct {
 	SenderBlockchainAddress    *string  `json:"sender_blockchain_address"`
 	RecipientBlockchainAddress *string  `json:"recipient_blockchain_address"`
@@ -304,7 +471,7 @@ type AmountResponse struct {
 
 func (ar *AmountResponse) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		Amount float32 `json:"amount`
+		Amount float32 `json:"amount"`
 	}{
 		Amount: ar.Amount,
 	})
